@@ -8,3 +8,9 @@ updates:
       interval: weekly
     commit-message:
       prefix: ci
+    # One grouped PR per run so same-repo actions (e.g. codeql-action init/analyze)
+    # bump together instead of failing CI one at a time.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
