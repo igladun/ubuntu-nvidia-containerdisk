@@ -1,5 +1,6 @@
 # Ubuntu NVIDIA ContainerDisk for KubeVirt
 
+[![Total downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fipitio.github.io%2Fbackage%2Figladun%2Fubuntu-nvidia-containerdisk%2Fubuntu-nvidia-containerdisk.json&query=%24.downloads&label=downloads&color=blue)](https://github.com/igladun/ubuntu-nvidia-containerdisk/pkgs/container/ubuntu-nvidia-containerdisk)
 [![Build And Publish](https://github.com/igladun/ubuntu-nvidia-containerdisk/actions/workflows/build-and-publish.yml/badge.svg)](https://github.com/igladun/ubuntu-nvidia-containerdisk/actions/workflows/build-and-publish.yml)
 [![CodeQL](https://github.com/igladun/ubuntu-nvidia-containerdisk/actions/workflows/codeql.yml/badge.svg)](https://github.com/igladun/ubuntu-nvidia-containerdisk/actions/workflows/codeql.yml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/igladun/ubuntu-nvidia-containerdisk/badge)](https://scorecard.dev/viewer/?uri=github.com/igladun/ubuntu-nvidia-containerdisk)
