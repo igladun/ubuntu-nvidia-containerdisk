@@ -26,8 +26,16 @@ image is published and the advisory is disclosed publicly.
 
 Every published image ships with:
 
+- A signed SLSA build provenance attestation proving the image was built by this
+  repository's workflow.
 - A CycloneDX SBOM, attested against the image digest.
-- Trivy vulnerability scanning of the baked disk, captured in the CycloneDX SBOM.
+- Trivy vulnerability scanning of the baked disk — publishing is blocked on fixable
+  CRITICAL/HIGH CVEs, and a weekly build re-checks against newly disclosed ones.
+- Release (`v*`) builds that always bake the disk fresh — the Actions cache is never
+  trusted for a release artifact.
 - GitHub Actions pinned to full-length commit SHAs and kept current by Dependabot.
 - The upstream Ubuntu base image verified against its published SHA256 checksum.
 - CodeQL analysis of the CI workflows and OpenSSF Scorecard monitoring.
+
+Consumers can verify both attestations against the registry; see the
+[README's Security section](README.md#security) for the `gh attestation` commands.
