@@ -1,0 +1,5 @@
+# Allowlist: the build context contains exactly the one file the Dockerfile
+# COPYs. Everything else (raw scan image, base qcow2, seed ISO, firmware
+# vars, .git) stays out by construction.
+*
+!out/ubuntu-noble-golden.qcow2

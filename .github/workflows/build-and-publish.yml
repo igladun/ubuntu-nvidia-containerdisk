@@ -10,6 +10,7 @@ on:
     # not evaluated for pushes of tags, so `v*` releases still always build.
     paths:
       - "Dockerfile"
+      - ".dockerignore"
       - "cloud-init/**"
       - "scripts/**"
       - ".github/workflows/build-and-publish.yml"
@@ -80,6 +81,11 @@ jobs:
 
       - name: Restore baked golden qcow2 from cache
         id: cache_bake
+        # Release tags never trust the Actions cache (keyed storage, not an
+        # integrity store — a poisoned entry would be published verbatim).
+        # Skipping restore leaves cache-hit empty, so every downstream
+        # condition falls through to a fresh bake on tags.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: out/ubuntu-noble-golden.qcow2
@@ -121,11 +127,55 @@ jobs:
         run: ./scripts/bake-image.sh
 
       - name: Save baked golden qcow2 to cache
-        if: steps.cache_bake.outputs.cache-hit != 'true'
+        # Tag builds never write the cache either — it is only ever populated
+        # by main-branch runs.
+        if: steps.cache_bake.outputs.cache-hit != 'true' && !startsWith(github.ref, 'refs/tags/')
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: out/ubuntu-noble-golden.qcow2
           key: bake-${{ hashFiles('scripts/bake-image.sh', 'cloud-init/**') }}-${{ steps.serial.outputs.serial }}
+
+      - name: Prepare raw disk image for scanning
+        run: |
+          # Trivy's qcow2 disk driver misreads sector 0 ("Invalid master boot
+          # record signature") regardless of compression, so convert to a raw
+          # disk image (sparse) whose sector 0 is the real GPT protective MBR.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-utils
+          qemu-img convert -O raw out/ubuntu-noble-golden.qcow2 out/ubuntu-noble-scan.raw
+          ls -lh out/ubuntu-noble-scan.raw
+          df -h .
+
+      # Publishing is gated on this scan: a fixable CRITICAL/HIGH CVE in the
+      # baked disk fails the job before anything is built or pushed. On the
+      # weekly scheduled run this doubles as a CVE alarm for the cached bake;
+      # remediate with a workflow_dispatch force_bake once fixes are released.
+      - name: Vulnerability gate on the baked disk
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: vm
+          scan-ref: out/ubuntu-noble-scan.raw
+          scanners: vuln
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: "true"
+
+      - name: Generate SBOM (CycloneDX) from baked qcow2
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: vm
+          scan-ref: out/ubuntu-noble-scan.raw
+          format: cyclonedx
+          output: sbom.cdx.json
+          scanners: vuln
+          list-all-pkgs: "true"
+
+      - name: Remove raw scan image
+        # The raw copy is tens of GiB on disk; drop it before the image build
+        # needs the space. .dockerignore keeps it out of the build context.
+        run: |
+          rm -f out/ubuntu-noble-scan.raw
+          df -h .
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -141,33 +191,12 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Prepare raw disk image for scanning
-        run: |
-          # Trivy's qcow2 disk driver misreads sector 0 ("Invalid master boot
-          # record signature") regardless of compression, so convert to a raw
-          # disk image (sparse) whose sector 0 is the real GPT protective MBR.
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-utils
-          qemu-img convert -O raw out/ubuntu-noble-golden.qcow2 out/ubuntu-noble-scan.raw
-          ls -lh out/ubuntu-noble-scan.raw
-          df -h .
-
-      - name: Generate SBOM (CycloneDX) from baked qcow2
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      - name: Attest build provenance of the pushed image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          scan-type: vm
-          scan-ref: out/ubuntu-noble-scan.raw
-          format: cyclonedx
-          output: sbom.cdx.json
-          scanners: vuln
-          list-all-pkgs: "true"
-
-      - name: Upload SBOM artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: sbom-cyclonedx
-          path: sbom.cdx.json
-          retention-days: 90
+          subject-name: ${{ steps.prep.outputs.image_name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
       - name: Attest SBOM against the pushed image
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
