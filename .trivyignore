@@ -1,0 +1,28 @@
+# NVIDIA-shipped Go binaries — container-toolkit v1.19.1 (nvidia-ctk,
+# nvidia-container-runtime, hooks; built with Go 1.23.4) and Nsight
+# Compute/Systems nic_sampler plugins (Go 1.26.3) — carry Go stdlib CVEs
+# that only an NVIDIA rebuild can fix; re-baking installs the same latest
+# stable packages and cannot clear them.
+#
+# Track: https://github.com/NVIDIA/nvidia-container-toolkit/releases
+# (waiting on >= 1.20.0 stable). Delete these entries once NVIDIA ships a
+# rebuilt toolkit/Nsight and force_bake — the packages are unpinned, so a
+# fresh bake picks the fix up automatically.
+#
+# Every suppression auto-expires (the gate re-arms) on the exp: date below.
+# Extend only with security-team sign-off.
+CVE-2025-61726 exp:2026-10-01
+CVE-2025-61729 exp:2026-10-01
+CVE-2025-68121 exp:2026-10-01
+CVE-2026-25679 exp:2026-10-01
+CVE-2026-27145 exp:2026-10-01
+CVE-2026-32280 exp:2026-10-01
+CVE-2026-32281 exp:2026-10-01
+CVE-2026-32283 exp:2026-10-01
+CVE-2026-33811 exp:2026-10-01
+CVE-2026-33814 exp:2026-10-01
+CVE-2026-39820 exp:2026-10-01
+CVE-2026-39822 exp:2026-10-01
+CVE-2026-39836 exp:2026-10-01
+CVE-2026-42499 exp:2026-10-01
+CVE-2026-42504 exp:2026-10-01

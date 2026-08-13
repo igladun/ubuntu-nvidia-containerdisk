@@ -30,8 +30,9 @@ Every published image ships with:
   repository's workflow.
 - A CycloneDX SBOM, attested against the image digest.
 - Trivy vulnerability scanning of the baked disk — publishing is blocked on fixable
-  CRITICAL/HIGH CVEs in OS packages, and a weekly build re-checks against newly
-  disclosed ones. Vendor-compiled binaries are inventoried in the SBOM.
+  CRITICAL/HIGH CVEs in OS packages and bundled binaries, and a weekly build re-checks
+  against newly disclosed ones. Reviewed, auto-expiring exceptions live in
+  [`.trivyignore`](.trivyignore).
 - Release (`v*`) builds that always bake the disk fresh — the Actions cache is never
   trusted for a release artifact.
 - GitHub Actions pinned to full-length commit SHAs and kept current by Dependabot.
