@@ -11,6 +11,7 @@ on:
     paths:
       - "Dockerfile"
       - ".dockerignore"
+      - ".trivyignore"
       - "cloud-init/**"
       - "scripts/**"
       - ".github/workflows/build-and-publish.yml"
@@ -146,24 +147,26 @@ jobs:
           ls -lh out/ubuntu-noble-scan.raw
           df -h .
 
-      # Publishing is gated on this scan: an OS package with a fixable
-      # CRITICAL/HIGH CVE in the baked disk fails the job before anything is
-      # built or pushed. Scoped to OS packages (vuln-type maps to trivy
-      # --pkg-types) because the NVIDIA-shipped Go binaries (container
-      # toolkit, Nsight) carry Go stdlib CVEs that only an NVIDIA rebuild can
-      # fix — re-baking cannot; they stay visible in the attested SBOM below.
-      # On the weekly scheduled run this doubles as a CVE alarm for the cached
-      # bake; remediate with a workflow_dispatch force_bake once fixes land.
+      # Publishing is gated on this scan: a fixable CRITICAL/HIGH CVE in the
+      # baked disk — OS packages AND bundled binaries/libraries — fails the
+      # job before anything is built or pushed. The NVIDIA-shipped Go
+      # binaries (container toolkit, Nsight) carry Go stdlib CVEs that only
+      # an NVIDIA rebuild can fix; those specific CVEs are suppressed via the
+      # reviewed .trivyignore, where every entry auto-expires (the gate
+      # re-arms) on its exp: date. On the weekly scheduled run this doubles
+      # as a CVE alarm for the cached bake; remediate with a
+      # workflow_dispatch force_bake once fixes land.
       - name: Vulnerability gate on the baked disk
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: vm
           scan-ref: out/ubuntu-noble-scan.raw
           scanners: vuln
-          vuln-type: os
+          vuln-type: os,library
           exit-code: "1"
           severity: CRITICAL,HIGH
           ignore-unfixed: "true"
+          trivyignores: .trivyignore
 
       - name: Generate SBOM (CycloneDX) from baked qcow2
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
