@@ -22,7 +22,6 @@ write_files:
       NVIDIA_DRIVER_VERSION=580.178.04-1ubuntu1
       NVIDIA_HEADLESS_PACKAGE="nvidia-headless-${NVIDIA_DRIVER_BRANCH}"
       NVIDIA_UTILS_PACKAGE="nvidia-utils-${NVIDIA_DRIVER_BRANCH}"
-      KVER="$(uname -r)"
 
       # CUDA 13.0 runtime libraries plus the parts of the dev toolkit that do not drag in
       # Nsight Compute/Systems. The cuda-toolkit-13-0 metapackage pulls cuda-tools ->
@@ -38,9 +37,10 @@ write_files:
         cuda-nvml-dev-13-0
       )
 
-      # Kernel metapackages the noble cloud image may ship. They are held during the bake
-      # so dist-upgrade cannot move the running kernel (the DKMS target) and purged at the
-      # end so a consumer VM cannot pull a kernel that lacks the NVIDIA module.
+      # Kernel metapackages the noble cloud image may ship. They pull the newest noble
+      # kernel in during dist-upgrade and are purged right after, so nothing later in the
+      # bake (or a consumer VM's unattended-upgrades) can pull a kernel that lacks the
+      # NVIDIA module.
       KERNEL_META_CANDIDATES=(
         linux-virtual linux-image-virtual linux-headers-virtual linux-modules-extra-virtual
         linux-generic linux-image-generic linux-headers-generic linux-modules-extra-generic
@@ -74,19 +74,49 @@ write_files:
       retry apt-get update
       retry apt-get install -y --no-install-recommends ca-certificates curl gnupg
 
-      # Apply the Ubuntu security and updates fixes that landed after the cloud image
-      # was respun. The running kernel is marked manual (so the autoremove at the end
-      # cannot take it once its metapackage is gone) and held together with the kernel
-      # metapackages, so dist-upgrade cannot change the kernel the NVIDIA module is
-      # built for. The metapackage hold is lifted again right before they are purged.
+      # Apply every Ubuntu security/updates fix that landed after the cloud image was
+      # respun, including the newest noble kernel: the kernel metapackages are still
+      # installed at this point, so dist-upgrade pulls the current linux-image-virtual
+      # kernel (and its headers) in next to the kernel the cloud image booted. Phased
+      # updates are included because the vulnerability gate knows nothing about phasing.
+      retry apt-get dist-upgrade -y --no-install-recommends \
+        -o APT::Get::Always-Include-Phased-Updates=true
+
+      # The NVIDIA module is built for the newest installed kernel, and that is the only
+      # kernel the image keeps. The bake VM itself keeps running the cloud image's kernel;
+      # DKMS does not need the target kernel to be the running one.
+      RUNNING_KERNEL="$(uname -r)"
+      KVER="$(linux-version list | linux-version sort | tail -n1)"
+      if [ -z "${KVER}" ] || [ ! -f "/boot/vmlinuz-${KVER}" ] || ! dpkg -s "linux-image-${KVER}" >/dev/null 2>&1; then
+        echo "FATAL: could not determine the newest installed kernel (got '${KVER}')"
+        exit 1
+      fi
+      # Version-ABI part of the kernel name (6.8.0-146 for 6.8.0-146-generic); the
+      # arch-independent linux-headers-<abi> package carries no flavour suffix.
+      KABI="${KVER%-*}"
+      echo "Running kernel: ${RUNNING_KERNEL}; building the NVIDIA module for: ${KVER}"
+      # Marked manual so the autoremove at the end cannot take it once its metapackage is
+      # gone, and held so nothing in the rest of the bake can move it.
       apt-mark manual "linux-image-${KVER}" "linux-modules-${KVER}"
       apt-mark hold "linux-image-${KVER}" "linux-modules-${KVER}"
-      HELD_KERNEL_METAS="$(installed_kernel_metas)"
-      if [ -n "${HELD_KERNEL_METAS}" ]; then
+      # The metapackages have done their job; purge them now so nothing later in the bake
+      # can pull yet another kernel.
+      KERNEL_METAS="$(installed_kernel_metas)"
+      if [ -n "${KERNEL_METAS}" ]; then
         # shellcheck disable=SC2086
-        apt-mark hold ${HELD_KERNEL_METAS}
+        apt-get purge -y ${KERNEL_METAS}
       fi
-      retry apt-get dist-upgrade -y --no-install-recommends
+      # Drop every other kernel's headers before nvidia-dkms is installed: its postinst
+      # builds for the running kernel as well as the newest one whenever both have headers,
+      # and that second build would cost another half hour for a kernel the image does not
+      # keep. Kernels without headers are skipped.
+      OTHER_HEADERS="$(dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'linux-headers-*' 2>/dev/null \
+        | awk '$1 == "installed" {print $2}' \
+        | grep -vE -- "^linux-headers-${KABI}(-|$)" || true)"
+      if [ -n "${OTHER_HEADERS}" ]; then
+        # shellcheck disable=SC2086
+        apt-get purge -y ${OTHER_HEADERS}
+      fi
 
       install -m 0755 -d /usr/share/keyrings
       curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/3bf863cc.pub \
@@ -115,9 +145,10 @@ write_files:
       EXACT_GPUCOMP_SPEC="libnvidia-gpucomp-${NVIDIA_DRIVER_BRANCH}=${NVIDIA_DRIVER_VERSION}"
       EXACT_CFG_SPEC="libnvidia-cfg1-${NVIDIA_DRIVER_BRANCH}=${NVIDIA_DRIVER_VERSION}"
 
-      # The NVIDIA kernel module is built with DKMS against the running kernel. Ubuntu's
-      # prebuilt linux-modules-nvidia-580 packages track a different branch point than
-      # the exact version pinned above, so they are deliberately not used.
+      # The NVIDIA kernel module is built with DKMS against the target kernel chosen above
+      # (the newest installed one). Ubuntu's prebuilt linux-modules-nvidia-580 packages
+      # track a different branch point than the exact version pinned above, so they are
+      # deliberately not used.
       retry apt-get install -y --no-install-recommends \
         build-essential dkms "linux-headers-$KVER"
       retry apt-get install -y --no-install-recommends \
@@ -209,7 +240,7 @@ write_files:
       /usr/local/sbin/load-nvidia-modules.sh || true
 
       echo "Kernel:" > /root/NVIDIA_OK.txt
-      uname -r >> /root/NVIDIA_OK.txt
+      echo "${KVER}" >> /root/NVIDIA_OK.txt
       echo >> /root/NVIDIA_OK.txt
       dpkg -l | egrep "nvidia-driver|nvidia-headless|nvidia-utils|nvidia-dkms|nvidia-container-toolkit" >> /root/NVIDIA_OK.txt || true
       nvidia-ctk --version >> /root/NVIDIA_OK.txt || true
@@ -221,24 +252,36 @@ write_files:
       dpkg -l "${CUDA_DEV_PACKAGES[@]}" >> /root/NVIDIA_OK.txt || true
       /usr/local/cuda-13.0/bin/nvcc --version >> /root/NVIDIA_OK.txt 2>&1 || true
 
-      # Pin to the exact kernel the NVIDIA module was built for (marked manual and held
-      # above); remove the kernel metapackages so a consumer VM's unattended-upgrades
-      # cannot install a newer kernel that lacks the module (DKMS built for uname -r,
-      # headers are purged below), and remove any other kernel for the same reason.
-      # Noble cloud images ship the *-virtual metapackage names.
-      CUR_KERNEL="$(uname -r)"
+      # Keep only the kernel the NVIDIA module was built for (marked manual and held
+      # above). The kernel metapackages are already gone (re-checked here), so a consumer
+      # VM's unattended-upgrades cannot install a kernel that lacks the module. Every
+      # other kernel is removed, including the one this bake VM is running (the cloud
+      # image's kernel: it has no NVIDIA module and carries whatever CVEs the upstream
+      # respin has not caught up with yet). linux-check-removal only warns about removing
+      # the running kernel under the noninteractive frontend, and nothing after this
+      # point loads new modules. Versioned linux-tools packages go too: they are built
+      # from the kernel source and the gate reports its CVEs against them.
+      CUR_KERNEL="${KVER}"
       KERNEL_METAS="$(installed_kernel_metas)"
       if [ -n "${KERNEL_METAS}" ]; then
         # shellcheck disable=SC2086
-        apt-mark unhold ${KERNEL_METAS}
-        # shellcheck disable=SC2086
         apt-get purge -y ${KERNEL_METAS}
       fi
-      OTHER_KERNELS="$(dpkg-query -W -f='${Package}\n' \
-        'linux-image-*-generic' 'linux-modules-*-generic' \
-        'linux-modules-extra-*-generic' 'linux-headers-*-generic' 2>/dev/null \
-        | grep -v -- "${CUR_KERNEL}" || true)"
-      [ -n "${OTHER_KERNELS}" ] && apt-get purge -y ${OTHER_KERNELS} || true
+      OTHER_KERNELS="$(dpkg-query -W -f='${db:Status-Status} ${Package}\n' \
+        'linux-image-[0-9]*' 'linux-modules-[0-9]*' 'linux-modules-extra-[0-9]*' \
+        'linux-headers-[0-9]*' 'linux-tools-[0-9]*' 'linux-cloud-tools-[0-9]*' 2>/dev/null \
+        | awk '$1 == "installed" {print $2}' \
+        | grep -vE -- "-${KABI}(-|$)" || true)"
+      if [ -n "${OTHER_KERNELS}" ]; then
+        # shellcheck disable=SC2086
+        apt-get purge -y ${OTHER_KERNELS}
+      fi
+      if [ "${RUNNING_KERNEL}" != "${CUR_KERNEL}" ]; then
+        # The purge leaves the running kernel's module directory behind (depmod output
+        # generated after it was installed); drop it so the module check below only
+        # sees kernels that are actually installed.
+        rm -rf "/lib/modules/${RUNNING_KERNEL}"
+      fi
 
       # Drop the kernel headers/source used to build the NVIDIA module, but keep the
       # C/C++ toolchain (build-essential) so the baked CUDA dev toolkit's nvcc is usable.
@@ -277,10 +320,17 @@ write_files:
       fi
       echo "CUDA 13.0 dev toolkit OK: $(${NVCC_PATH} --version | awk '/release/ {print}')"
 
-      # Fail the bake loudly if the kernel pin did not take: the running kernel must still
-      # be installed and bootable, and no kernel metapackage may remain to pull another.
+      # Fail the bake loudly if the kernel pin did not take: the target kernel must be
+      # installed and bootable, it must be the only kernel left (the cloud image's kernel
+      # is gone), and no kernel metapackage may remain to pull another.
       if [ ! -f "/boot/vmlinuz-${CUR_KERNEL}" ] || ! dpkg -s "linux-image-${CUR_KERNEL}" >/dev/null 2>&1; then
-        echo "FATAL: running kernel ${CUR_KERNEL} is no longer installed after the purge"
+        echo "FATAL: target kernel ${CUR_KERNEL} is not installed after the purge"
+        exit 1
+      fi
+      INSTALLED_KERNELS="$(dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'linux-image-[0-9]*' 2>/dev/null \
+        | awk '$1 == "installed" {print $2}' | tr '\n' ' ')"
+      if [ "${INSTALLED_KERNELS}" != "linux-image-${CUR_KERNEL} " ]; then
+        echo "FATAL: expected only linux-image-${CUR_KERNEL} to be installed, found: ${INSTALLED_KERNELS}"
         exit 1
       fi
       LEFTOVER_KERNEL_METAS="$(installed_kernel_metas)"
@@ -288,7 +338,7 @@ write_files:
         echo "FATAL: kernel metapackages still installed: ${LEFTOVER_KERNEL_METAS}"
         exit 1
       fi
-      echo "Kernel pin OK: ${CUR_KERNEL} held, no kernel metapackages installed"
+      echo "Kernel pin OK: ${CUR_KERNEL} held, no other kernel or kernel metapackage installed"
 
       cloud-init clean --logs
       truncate -s 0 /etc/machine-id

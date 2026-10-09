@@ -9,3 +9,13 @@
 # The Nsight Compute/Systems Go binaries that used to live here are no longer
 # installed; the image ships the CUDA compiler, dev libraries and command-line
 # tools instead of the full cuda-toolkit metapackage.
+
+# nvidia-container-toolkit 1.20.1-1 is the newest release in both NVIDIA apt repos
+# (checked 2026-10-09) and is built with Go 1.27.1; these two Go stdlib HIGH
+# denial-of-service CVEs (net/http Range parsing, crypto/tls ECH extension handling)
+# are fixed in Go 1.27.2 and only an NVIDIA rebuild clears them. They are reported
+# against /usr/bin/nvidia-ctk, nvidia-cdi-hook, nvidia-container-runtime and
+# nvidia-container-runtime-hook, none of which serves HTTP or TLS. Remove as soon as
+# a toolkit built with Go >= 1.27.2 ships; the gate goes red again when they expire.
+CVE-2026-78667 exp:2026-11-20
+CVE-2026-97031 exp:2026-11-20
