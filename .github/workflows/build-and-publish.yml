@@ -214,6 +214,22 @@ jobs:
           output: sbom.cdx.json
           list-all-pkgs: "true"
 
+      - name: Check the SBOM before it is attested
+        run: |
+          set -euo pipefail
+          size="$(stat -c%s sbom.cdx.json)"
+          components="$(jq '.components | length' sbom.cdx.json)"
+          vulns="$(jq '.vulnerabilities // [] | length' sbom.cdx.json)"
+          echo "SBOM: ${size} bytes, ${components} components, ${vulns} embedded vulnerabilities"
+          if [ "$vulns" -ne 0 ]; then
+            echo "SBOM unexpectedly embeds vulnerability data; it is meant to be an inventory" >&2
+            exit 1
+          fi
+          if [ "$size" -ge 16777216 ]; then
+            echo "SBOM is ${size} bytes, over the 16 MiB attestation limit" >&2
+            exit 1
+          fi
+
       - name: Remove raw scan image
         # The raw copy is tens of GiB on disk; drop it before the image build
         # needs the space. .dockerignore keeps it out of the build context.
