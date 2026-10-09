@@ -14,3 +14,12 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # The busybox staging stage in the Dockerfile is digest-pinned; keep that digest
+  # current as well.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build

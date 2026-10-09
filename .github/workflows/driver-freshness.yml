@@ -1,0 +1,62 @@
+name: Driver Freshness
+
+# The vulnerability gate has no advisory data for the NVIDIA driver packages (they
+# come from NVIDIA's own apt repo, not Ubuntu's archive) and Dependabot cannot read
+# an apt version pin, so this is the only signal that the pinned driver has fallen
+# behind. It goes red for any newer 580.x build, not only security releases; the
+# NVIDIA security bulletins (https://www.nvidia.com/en-us/security/) decide how
+# urgent the bump is.
+on:
+  schedule:
+    # Monday 05:00 UTC, an hour before the weekly publish.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Pinned driver vs NVIDIA repo
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare the pinned driver with the newest build in NVIDIA's repo
+        env:
+          REPO_INDEX: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/Packages.gz
+        run: |
+          set -euo pipefail
+          pinned="$(sed -nE 's/^ *NVIDIA_DRIVER_VERSION=([^ ]+) *$/\1/p' cloud-init/user-data | head -n 1)"
+          branch="$(sed -nE 's/^ *NVIDIA_DRIVER_BRANCH=([0-9]+) *$/\1/p' cloud-init/user-data | head -n 1)"
+          if [ -z "$pinned" ] || [ -z "$branch" ]; then
+            echo "Could not read NVIDIA_DRIVER_VERSION / NVIDIA_DRIVER_BRANCH from cloud-init/user-data" >&2
+            exit 1
+          fi
+          curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 -o Packages.gz "$REPO_INDEX"
+          latest=""
+          while IFS= read -r version; do
+            if [ -z "$latest" ] || dpkg --compare-versions "$version" gt "$latest"; then
+              latest="$version"
+            fi
+          done < <(gzip -dc Packages.gz | awk -v pkg="nvidia-headless-${branch}" '$0 == ("Package: " pkg) {found = 1; next} found && /^Version:/ {print $2; found = 0}')
+          if [ -z "$latest" ]; then
+            echo "No nvidia-headless-${branch} package found in the NVIDIA repo index" >&2
+            exit 1
+          fi
+          {
+            echo "## NVIDIA driver freshness"
+            echo ""
+            echo "- Pinned in cloud-init/user-data: \`$pinned\`"
+            echo "- Newest ${branch}.x build in NVIDIA's ubuntu2404 repo: \`$latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if dpkg --compare-versions "$pinned" lt "$latest"; then
+            echo "::error::Pinned driver $pinned is older than $latest. Check NVIDIA's security bulletins and bump NVIDIA_DRIVER_VERSION in cloud-init/user-data."
+            exit 1
+          fi
+          echo "Pinned driver $pinned is the newest ${branch}.x build in the repo ($latest)."
