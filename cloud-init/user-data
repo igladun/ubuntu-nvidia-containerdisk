@@ -14,21 +14,37 @@ write_files:
       export DEBIAN_FRONTEND=noninteractive
 
       NVIDIA_DRIVER_BRANCH=580
-      # NVIDIA's Ubuntu 24.04 repo publishes this requested driver as 580.105.08-0ubuntu1.
-      NVIDIA_DRIVER_VERSION=580.105.08-0ubuntu1
-      NVIDIA_DRIVER_PACKAGE="nvidia-driver-${NVIDIA_DRIVER_BRANCH}"
+      # NVIDIA's Ubuntu 24.04 repo publishes this driver as 580.178.04-1ubuntu1: the fixed
+      # version from NVIDIA's September 2026 GPU display driver security bulletin (note the
+      # -1ubuntu1 packaging suffix, older builds used -0ubuntu1). The Trivy gate does not
+      # see NVIDIA driver CVEs at all, so the weekly driver-freshness workflow fails when
+      # the repo carries a newer 580.x build than this pin.
+      NVIDIA_DRIVER_VERSION=580.178.04-1ubuntu1
       NVIDIA_HEADLESS_PACKAGE="nvidia-headless-${NVIDIA_DRIVER_BRANCH}"
-      NVIDIA_HEADLESS_NO_DKMS_PACKAGE="nvidia-headless-no-dkms-${NVIDIA_DRIVER_BRANCH}"
       NVIDIA_UTILS_PACKAGE="nvidia-utils-${NVIDIA_DRIVER_BRANCH}"
-      NVIDIA_MODULES_PACKAGE="linux-modules-nvidia-${NVIDIA_DRIVER_BRANCH}-$(uname -r)"
       KVER="$(uname -r)"
 
-      # CUDA 13.0 runtime libraries + full dev toolkit (nvcc, headers, dev libraries).
-      # Neither the cuda-libraries nor the cuda-toolkit metapackage depends on
-      # cuda-drivers, so they cannot fight the exact 580.105.08 driver pin; libcuda.so
-      # still comes from libnvidia-compute-580.
+      # CUDA 13.0 runtime libraries plus the parts of the dev toolkit that do not drag in
+      # Nsight Compute/Systems. The cuda-toolkit-13-0 metapackage pulls cuda-tools ->
+      # cuda-visual-tools -> Nsight, whose bundled Go binaries (nic_sampler plugins) carry
+      # Go stdlib CVEs that only an NVIDIA rebuild can fix. None of these packages depend
+      # on cuda-drivers, so they cannot fight the exact driver pin; libcuda.so still comes
+      # from libnvidia-compute-580.
       CUDA_RUNTIME_PACKAGE="cuda-libraries-13-0"
-      CUDA_DEV_PACKAGE="cuda-toolkit-13-0"
+      CUDA_DEV_PACKAGES=(
+        cuda-compiler-13-0
+        cuda-libraries-dev-13-0
+        cuda-command-line-tools-13-0
+        cuda-nvml-dev-13-0
+      )
+
+      # Kernel metapackages the noble cloud image may ship. They are held during the bake
+      # so dist-upgrade cannot move the running kernel (the DKMS target) and purged at the
+      # end so a consumer VM cannot pull a kernel that lacks the NVIDIA module.
+      KERNEL_META_CANDIDATES=(
+        linux-virtual linux-image-virtual linux-headers-virtual linux-modules-extra-virtual
+        linux-generic linux-image-generic linux-headers-generic linux-modules-extra-generic
+      )
 
       retry() {
         for i in 1 2 3 4 5; do
@@ -44,8 +60,33 @@ write_files:
         grep -qxF "$line" "$file" 2>/dev/null || echo "$line" >> "$file"
       }
 
+      # Names from KERNEL_META_CANDIDATES that dpkg reports as installed, one per line.
+      installed_kernel_metas() {
+        dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'linux-*' 2>/dev/null \
+          | awk '$1 == "installed" {print $2}' \
+          | grep -Fxf <(printf '%s\n' "${KERNEL_META_CANDIDATES[@]}") || true
+      }
+
+      # apt-daily / unattended-upgrades may hold the dpkg lock early in the first boot;
+      # wait for it instead of failing. Removed again before the image is sealed.
+      echo 'DPkg::Lock::Timeout "300";' > /etc/apt/apt.conf.d/99bake-lock-timeout
+
       retry apt-get update
       retry apt-get install -y --no-install-recommends ca-certificates curl gnupg
+
+      # Apply the Ubuntu security and updates fixes that landed after the cloud image
+      # was respun. The running kernel is marked manual (so the autoremove at the end
+      # cannot take it once its metapackage is gone) and held together with the kernel
+      # metapackages, so dist-upgrade cannot change the kernel the NVIDIA module is
+      # built for. The metapackage hold is lifted again right before they are purged.
+      apt-mark manual "linux-image-${KVER}" "linux-modules-${KVER}"
+      apt-mark hold "linux-image-${KVER}" "linux-modules-${KVER}"
+      HELD_KERNEL_METAS="$(installed_kernel_metas)"
+      if [ -n "${HELD_KERNEL_METAS}" ]; then
+        # shellcheck disable=SC2086
+        apt-mark hold ${HELD_KERNEL_METAS}
+      fi
+      retry apt-get dist-upgrade -y --no-install-recommends
 
       install -m 0755 -d /usr/share/keyrings
       curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/3bf863cc.pub \
@@ -62,10 +103,8 @@ write_files:
 
       retry apt-get update
 
-      EXACT_HEADLESS_SPEC="${NVIDIA_HEADLESS_NO_DKMS_PACKAGE}=${NVIDIA_DRIVER_VERSION}"
       EXACT_HEADLESS_DKMS_SPEC="${NVIDIA_HEADLESS_PACKAGE}=${NVIDIA_DRIVER_VERSION}"
       EXACT_UTILS_SPEC="${NVIDIA_UTILS_PACKAGE}=${NVIDIA_DRIVER_VERSION}"
-      EXACT_DRIVER_SPEC="${NVIDIA_DRIVER_PACKAGE}=${NVIDIA_DRIVER_VERSION}"
       EXACT_DKMS_SPEC="nvidia-dkms-${NVIDIA_DRIVER_BRANCH}=${NVIDIA_DRIVER_VERSION}"
       EXACT_KERNEL_COMMON_SPEC="nvidia-kernel-common-${NVIDIA_DRIVER_BRANCH}=${NVIDIA_DRIVER_VERSION}"
       EXACT_KERNEL_SOURCE_SPEC="nvidia-kernel-source-${NVIDIA_DRIVER_BRANCH}=${NVIDIA_DRIVER_VERSION}"
@@ -76,44 +115,23 @@ write_files:
       EXACT_GPUCOMP_SPEC="libnvidia-gpucomp-${NVIDIA_DRIVER_BRANCH}=${NVIDIA_DRIVER_VERSION}"
       EXACT_CFG_SPEC="libnvidia-cfg1-${NVIDIA_DRIVER_BRANCH}=${NVIDIA_DRIVER_VERSION}"
 
-      # Exact-version driver builds cannot safely use Ubuntu's kernel module package when that
-      # package was built against a newer NVIDIA branch point (for example >= 580.126.09).
-      USE_PREBUILT_MODULES=false
-      if [ -z "${NVIDIA_DRIVER_VERSION}" ] && \
-         apt-cache show "$NVIDIA_MODULES_PACKAGE" >/dev/null 2>&1 && \
-         apt-cache madison "$NVIDIA_HEADLESS_NO_DKMS_PACKAGE" | awk '{print $3}' | grep -Fxq "$NVIDIA_DRIVER_VERSION" && \
-         apt-cache madison "$NVIDIA_UTILS_PACKAGE" | awk '{print $3}' | grep -Fxq "$NVIDIA_DRIVER_VERSION"; then
-        USE_PREBUILT_MODULES=true
-      fi
-
-      if [ "$USE_PREBUILT_MODULES" = "true" ]; then
-        retry apt-get install -y --no-install-recommends \
-          "$NVIDIA_MODULES_PACKAGE" \
-          "$EXACT_KERNEL_COMMON_SPEC" \
-          "$EXACT_KERNEL_SOURCE_SPEC" \
-          "$EXACT_COMPUTE_SPEC" \
-          "$EXACT_COMMON_SPEC" \
-          "$EXACT_EXTRA_SPEC" \
-          "$EXACT_GPUCOMP_SPEC" \
-          "$EXACT_CFG_SPEC" \
-          "$EXACT_HEADLESS_SPEC" \
-          "$EXACT_UTILS_SPEC"
-      else
-        retry apt-get install -y --no-install-recommends \
-          build-essential dkms "linux-headers-$KVER"
-        retry apt-get install -y --no-install-recommends \
-          "$EXACT_FIRMWARE_SPEC" \
-          "$EXACT_DKMS_SPEC" \
-          "$EXACT_KERNEL_COMMON_SPEC" \
-          "$EXACT_KERNEL_SOURCE_SPEC" \
-          "$EXACT_COMPUTE_SPEC" \
-          "$EXACT_COMMON_SPEC" \
-          "$EXACT_EXTRA_SPEC" \
-          "$EXACT_GPUCOMP_SPEC" \
-          "$EXACT_CFG_SPEC" \
-          "$EXACT_UTILS_SPEC" \
-          "$EXACT_HEADLESS_DKMS_SPEC"
-      fi
+      # The NVIDIA kernel module is built with DKMS against the running kernel. Ubuntu's
+      # prebuilt linux-modules-nvidia-580 packages track a different branch point than
+      # the exact version pinned above, so they are deliberately not used.
+      retry apt-get install -y --no-install-recommends \
+        build-essential dkms "linux-headers-$KVER"
+      retry apt-get install -y --no-install-recommends \
+        "$EXACT_FIRMWARE_SPEC" \
+        "$EXACT_DKMS_SPEC" \
+        "$EXACT_KERNEL_COMMON_SPEC" \
+        "$EXACT_KERNEL_SOURCE_SPEC" \
+        "$EXACT_COMPUTE_SPEC" \
+        "$EXACT_COMMON_SPEC" \
+        "$EXACT_EXTRA_SPEC" \
+        "$EXACT_GPUCOMP_SPEC" \
+        "$EXACT_CFG_SPEC" \
+        "$EXACT_UTILS_SPEC" \
+        "$EXACT_HEADLESS_DKMS_SPEC"
 
       cat >/etc/modules-load.d/nvidia.conf <<'EOF'
       nvidia
@@ -155,18 +173,16 @@ write_files:
       append_if_missing "nvidia_modeset" /etc/initramfs-tools/modules
       append_if_missing "nvidia_drm" /etc/initramfs-tools/modules
 
-      if [ "$USE_PREBUILT_MODULES" != "true" ]; then
-        dkms autoinstall -k "$KVER" || true
-      fi
+      dkms autoinstall -k "$KVER" || true
       depmod -a "$KVER" || true
       update-initramfs -u -k "$KVER"
       sync
 
-      # CUDA 13.0 runtime libraries + dev toolkit (native pairing for driver branch 580).
-      # The CUDA apt repo + keyring configured above already provide these packages;
-      # cuda-toolkit-13-0 brings nvcc and dev headers/libraries but not cuda-drivers
+      # CUDA 13.0 runtime libraries + the Nsight-free dev toolkit (native pairing for
+      # driver branch 580). The CUDA apt repo + keyring configured above already provide
+      # these packages; they bring nvcc, headers and dev libraries but not cuda-drivers
       # (recommends are skipped), so the exact 580 driver pin is preserved.
-      retry apt-get install -y --no-install-recommends "${CUDA_RUNTIME_PACKAGE}" "${CUDA_DEV_PACKAGE}"
+      retry apt-get install -y --no-install-recommends "${CUDA_RUNTIME_PACKAGE}" "${CUDA_DEV_PACKAGES[@]}"
 
       # nvcc needs a host C/C++ toolchain; install build-essential explicitly (marked
       # manual) so the autoremove later keeps it for a usable dev image.
@@ -202,14 +218,22 @@ write_files:
       dpkg -l "${CUDA_RUNTIME_PACKAGE}" >> /root/NVIDIA_OK.txt || true
       echo >> /root/NVIDIA_OK.txt
       echo "CUDA dev toolkit:" >> /root/NVIDIA_OK.txt
-      dpkg -l "${CUDA_DEV_PACKAGE}" >> /root/NVIDIA_OK.txt || true
+      dpkg -l "${CUDA_DEV_PACKAGES[@]}" >> /root/NVIDIA_OK.txt || true
       /usr/local/cuda-13.0/bin/nvcc --version >> /root/NVIDIA_OK.txt 2>&1 || true
 
-      # Pin to the exact kernel the NVIDIA module was built for; remove any other kernel
-      # so the VM cannot boot a kernel that lacks the module (DKMS built for uname -r).
+      # Pin to the exact kernel the NVIDIA module was built for (marked manual and held
+      # above); remove the kernel metapackages so a consumer VM's unattended-upgrades
+      # cannot install a newer kernel that lacks the module (DKMS built for uname -r,
+      # headers are purged below), and remove any other kernel for the same reason.
+      # Noble cloud images ship the *-virtual metapackage names.
       CUR_KERNEL="$(uname -r)"
-      apt-mark hold "linux-image-${CUR_KERNEL}" "linux-modules-${CUR_KERNEL}" 2>/dev/null || true
-      apt-get purge -y linux-generic linux-image-generic linux-headers-generic 2>/dev/null || true
+      KERNEL_METAS="$(installed_kernel_metas)"
+      if [ -n "${KERNEL_METAS}" ]; then
+        # shellcheck disable=SC2086
+        apt-mark unhold ${KERNEL_METAS}
+        # shellcheck disable=SC2086
+        apt-get purge -y ${KERNEL_METAS}
+      fi
       OTHER_KERNELS="$(dpkg-query -W -f='${Package}\n' \
         'linux-image-*-generic' 'linux-modules-*-generic' \
         'linux-modules-extra-*-generic' 'linux-headers-*-generic' 2>/dev/null \
@@ -253,12 +277,35 @@ write_files:
       fi
       echo "CUDA 13.0 dev toolkit OK: $(${NVCC_PATH} --version | awk '/release/ {print}')"
 
+      # Fail the bake loudly if the kernel pin did not take: the running kernel must still
+      # be installed and bootable, and no kernel metapackage may remain to pull another.
+      if [ ! -f "/boot/vmlinuz-${CUR_KERNEL}" ] || ! dpkg -s "linux-image-${CUR_KERNEL}" >/dev/null 2>&1; then
+        echo "FATAL: running kernel ${CUR_KERNEL} is no longer installed after the purge"
+        exit 1
+      fi
+      LEFTOVER_KERNEL_METAS="$(installed_kernel_metas)"
+      if [ -n "${LEFTOVER_KERNEL_METAS}" ]; then
+        echo "FATAL: kernel metapackages still installed: ${LEFTOVER_KERNEL_METAS}"
+        exit 1
+      fi
+      echo "Kernel pin OK: ${CUR_KERNEL} held, no kernel metapackages installed"
+
       cloud-init clean --logs
       truncate -s 0 /etc/machine-id
       rm -f /var/lib/dbus/machine-id
       ln -sf /etc/machine-id /var/lib/dbus/machine-id
       apt-get clean
       rm -rf /var/lib/apt/lists/*
+      rm -f /etc/apt/apt.conf.d/99bake-lock-timeout
+
+      # Strip the SSH host keys cloud-init generated during this bake boot; they must not
+      # ship in a public image. cloud-init's ssh module regenerates them on the first boot
+      # of every VM (cloud-init clean above makes that boot a fresh instance).
+      rm -f /etc/ssh/ssh_host_*
+      if ls /etc/ssh/ssh_host_* >/dev/null 2>&1; then
+        echo "FATAL: SSH host keys still present in the image"
+        exit 1
+      fi
 
       # Zero free space so deleted clusters compress away and qemu-img convert can drop them.
       dd if=/dev/zero of=/EMPTY bs=1M || true
