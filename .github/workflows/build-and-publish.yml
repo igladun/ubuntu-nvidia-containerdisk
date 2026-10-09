@@ -44,6 +44,8 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+      # Only for the "open an issue when a scheduled publish fails" step.
+      issues: write
 
     steps:
       - name: Free disk space
@@ -55,6 +57,8 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -67,30 +71,69 @@ jobs:
         id: prep
         run: echo "image_name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ubuntu-nvidia-containerdisk" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve upstream Ubuntu image serial
+      - name: Resolve and verify the upstream Ubuntu image checksum
         id: serial
+        env:
+          # Fingerprint of "UEC Image Automatic Signing Key <cdimage@ubuntu.com>", the key
+          # Canonical signs the cloud-images.ubuntu.com checksum files with. Published at
+          # https://documentation.ubuntu.com/public-images/public-images-how-to/verify-image-checksum/
+          UBUNTU_CLOUD_IMAGE_KEY_FPR: D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81
         run: |
           set -euo pipefail
-          sums="$(curl -fsSL https://cloud-images.ubuntu.com/noble/current/SHA256SUMS)"
-          serial="$(printf '%s\n' "$sums" | awk '/noble-server-cloudimg-amd64\.img$/ {print $1; exit}')"
+          base=https://cloud-images.ubuntu.com/noble/current
+          work="$(mktemp -d)"
+          curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 -o "$work/SHA256SUMS" "$base/SHA256SUMS"
+          curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 -o "$work/SHA256SUMS.gpg" "$base/SHA256SUMS.gpg"
+
+          # Verify the checksum file against Canonical's signing key before trusting any
+          # value in it. A same-origin SHA256 alone only proves the download matched
+          # whatever the server served at the time.
+          export GNUPGHOME="$work/gnupg"
+          mkdir -m 0700 "$GNUPGHOME"
+          for attempt in 1 2 3 4 5; do
+            if gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys "$UBUNTU_CLOUD_IMAGE_KEY_FPR"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "Could not fetch the Ubuntu cloud image signing key" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          status="$(gpg --batch --status-fd 1 --verify "$work/SHA256SUMS.gpg" "$work/SHA256SUMS" 2>/dev/null || true)"
+          if ! grep -q "^\[GNUPG:\] VALIDSIG ${UBUNTU_CLOUD_IMAGE_KEY_FPR} " <<< "$status"; then
+            echo "SHA256SUMS signature did not verify against key ${UBUNTU_CLOUD_IMAGE_KEY_FPR}" >&2
+            printf '%s\n' "$status" >&2
+            exit 1
+          fi
+
+          serial="$(awk '/noble-server-cloudimg-amd64\.img$/ {print $1; exit}' "$work/SHA256SUMS")"
           if [ -z "$serial" ]; then
             echo "Could not resolve upstream amd64 image checksum" >&2
             exit 1
           fi
-          echo "serial=$serial" >> "$GITHUB_OUTPUT"
-          echo "Upstream noble amd64 serial (sha256): $serial"
+          {
+            echo "serial=$serial"
+            # ISO year-week. It rotates the bake cache key so the Monday schedule always
+            # bakes a fresh disk and pushes later in the week reuse that week's disk.
+            echo "week=$(date -u +%G-%V)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Upstream noble amd64 serial (sha256): $serial (signature verified)"
 
       - name: Restore baked golden qcow2 from cache
         id: cache_bake
         # Release tags never trust the Actions cache (keyed storage, not an
         # integrity store — a poisoned entry would be published verbatim).
         # Skipping restore leaves cache-hit empty, so every downstream
-        # condition falls through to a fresh bake on tags.
+        # condition falls through to a fresh bake on tags. The key also carries
+        # the ISO week, so the weekly schedule never rescans a stale disk: it
+        # bakes fresh (picking up Ubuntu security updates) and seeds the cache
+        # that pushes later in the week reuse.
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: out/ubuntu-noble-golden.qcow2
-          key: bake-${{ hashFiles('scripts/bake-image.sh', 'cloud-init/**') }}-${{ steps.serial.outputs.serial }}
+          key: bake-${{ hashFiles('scripts/bake-image.sh', 'cloud-init/**') }}-${{ steps.serial.outputs.serial }}-${{ steps.serial.outputs.week }}
 
       - name: Extract Docker metadata
         id: meta
@@ -134,7 +177,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: out/ubuntu-noble-golden.qcow2
-          key: bake-${{ hashFiles('scripts/bake-image.sh', 'cloud-init/**') }}-${{ steps.serial.outputs.serial }}
+          key: bake-${{ hashFiles('scripts/bake-image.sh', 'cloud-init/**') }}-${{ steps.serial.outputs.serial }}-${{ steps.serial.outputs.week }}
 
       - name: Prepare raw disk image for scanning
         run: |
@@ -163,9 +206,12 @@ jobs:
         with:
           scan-type: vm
           scan-ref: out/ubuntu-noble-scan.raw
+          # Inventory only: with --format cyclonedx Trivy omits vulnerability data
+          # unless scanners=vuln is set. Embedding it bloated the SBOM past the
+          # 16 MiB attestation limit (mostly unfixed kernel CVEs repeated per
+          # kernel package) and the gate step above already does the scanning.
           format: cyclonedx
           output: sbom.cdx.json
-          scanners: vuln
           list-all-pkgs: "true"
 
       - name: Remove raw scan image
@@ -178,16 +224,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Build and push containerDisk image
+      - name: Build and push containerDisk image by digest
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: ./Dockerfile
-          push: true
+          # Push by digest only. The human-readable tags are applied after both
+          # attestations exist, so no tag ever points at an unattested image.
+          # provenance stays off: buildx's own attestation would wrap the single
+          # manifest in an index and change the digest that gets attested/tagged.
           provenance: false
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.prep.outputs.image_name }}
           labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
 
       - name: Attest build provenance of the pushed image
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -203,6 +253,35 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           sbom-path: sbom.cdx.json
           push-to-registry: true
+
+      - name: Tag the attested image
+        env:
+          IMAGE: ${{ steps.prep.outputs.image_name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tags=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              tags+=("$tag")
+            fi
+          done <<< "$TAGS"
+          args=()
+          for tag in "${tags[@]}"; do
+            args+=(--tag "$tag")
+          done
+          # --prefer-index=false keeps the single-platform manifest as is, so every
+          # tag resolves to exactly the digest the attestations were made for.
+          docker buildx imagetools create --prefer-index=false "${args[@]}" "${IMAGE}@${DIGEST}"
+          for tag in "${tags[@]}"; do
+            actual="$(docker buildx imagetools inspect "$tag" --format '{{.Manifest.Digest}}')"
+            if [ "$actual" != "$DIGEST" ]; then
+              echo "$tag resolves to $actual, expected $DIGEST" >&2
+              exit 1
+            fi
+            echo "$tag -> $actual"
+          done
 
       - name: Job summary
         if: always()
@@ -221,8 +300,26 @@ jobs:
             fi
             echo "- **Image digest:** ${{ steps.build.outputs.digest }}"
             echo ""
-            echo "### Pushed tags"
+            echo "### Tags (applied only after both attestations)"
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue when a scheduled publish fails
+        # Scheduled runs have no PR or push to surface a red check on; without
+        # this, a failing weekly build only emails the actor.
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Scheduled publish failed"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still failing: $RUN_URL"
+          else
+            body="$(printf 'The weekly scheduled build failed and nothing was published.\n\nRun: %s\n\nUsual causes: a fixable CVE in the freshly baked disk (wait for the upstream fix or add a scoped, expiring exception to .trivyignore), a driver behind the freshness check, or an attestation failure.' "$RUN_URL")"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
