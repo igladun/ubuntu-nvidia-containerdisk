@@ -16,7 +16,7 @@ This repo bakes an Ubuntu 24.04 cloud image into a [KubeVirt](https://kubevirt.i
 - **CUDA 13.0 dev toolkit without Nsight** (`cuda-compiler-13-0`, `cuda-libraries-dev-13-0`, `cuda-command-line-tools-13-0`, `cuda-nvml-dev-13-0`) — `nvcc`, headers, dev libraries and CLI tools (plus the runtime), with `nvcc` on `PATH` via `/etc/profile.d/cuda.sh`. Nsight Compute/Systems are left out on purpose: their bundled Go binaries carry CVEs only NVIDIA can rebuild away.
 - **NVIDIA Container Toolkit**
 - **cloud-init** ready; SSH host keys are stripped from the image and regenerated on each VM's first boot
-- Ubuntu security updates applied at bake time, on top of the latest upstream cloud image
+- Ubuntu security updates applied at bake time on top of the latest upstream cloud image, including the newest noble kernel: the NVIDIA module is built for that kernel and the cloud image's own kernel is removed
 - Single pinned kernel: the kernel metapackages are removed, so the VM cannot install or boot a kernel that lacks the NVIDIA module. Kernel updates arrive only by pulling a newer image.
 - 100 GiB virtual disk, sparsified and compressed qcow2
 
