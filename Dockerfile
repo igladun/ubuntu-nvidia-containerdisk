@@ -6,7 +6,7 @@
 # to the importer. The directory needs 0555; the disk file itself stays 0444.
 # Digest-pinned (multi-arch index for 1.36-uclibc): this stage's chown/chmod
 # run over the disk image, so the tag alone must not decide what executes here.
-FROM busybox:1.36-uclibc@sha256:0872fb3a7632ba9d0ae46a8e832a62b30ce83a6f220b8bb52903d9cf477dabe3 AS staging
+FROM busybox:1.38-uclibc@sha256:b699b0c739b2d039afd8e2488a3ccfc0b9a86301d87633448d4a93c57bee8c76 AS staging
 COPY out/ubuntu-noble-golden.qcow2 /staging/disk/ubuntu-noble.img
 RUN chown -R 107:107 /staging/disk \
     && chmod 0555 /staging/disk \
